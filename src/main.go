@@ -6,11 +6,12 @@ import (
 	"fmt"
 	"log"
 	"net"
-
 	"net/http"
 	"net/url"
 	"time"
 )
+
+// ---- response envelope helpers ----
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
@@ -18,12 +19,33 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
+func writeSuccess(w http.ResponseWriter, status int, data any) {
+	writeJSON(w, status, map[string]any{
+		"status": "success",
+		"data":   data,
+	})
+}
+
+func writeError(w http.ResponseWriter, status int, message string) {
+	writeJSON(w, status, map[string]any{
+		"status":  "error",
+		"message": message,
+	})
+}
+
+func isConfident(probability float64, sampleSize int) bool {
+	const minProbability = 0.7
+	const minSampleSize = 100
+	return probability >= minProbability && sampleSize >= minSampleSize
+}
+// ---- handlers ----
+
 func rootHandler(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path != "/" {
-		http.NotFound(w, r)
+		writeError(w, http.StatusNotFound, "not found")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any {
+	writeSuccess(w, http.StatusOK, map[string]any{
 		"message": "Hurray!!! API is up and running",
 	})
 }
@@ -32,18 +54,19 @@ func classifyHandler(w http.ResponseWriter, r *http.Request) {
 	allowedParams := map[string]bool{"name": true}
 	for key := range r.URL.Query() {
 		if !allowedParams[key] {
-			http.Error(w, fmt.Sprintf("unexpected query parameter: %s", key), http.StatusBadRequest)
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("unexpected query parameter: %s", key))
+			return
 		}
 	}
+
 	name := r.URL.Query().Get("name")
 	if name == "" {
-		http.Error(w, "Missing name parameter", http.StatusBadRequest)
+		writeError(w, http.StatusBadRequest, "missing name parameter")
 		return
 	}
-	client := &http.Client{
-		Timeout: 10 * time.Second,
 
-	}
+	client := &http.Client{Timeout: 20 * time.Second}
+
 	baseURL, _ := url.Parse("https://api.genderize.io")
 	params := url.Values{}
 	params.Add("name", name)
@@ -51,65 +74,73 @@ func classifyHandler(w http.ResponseWriter, r *http.Request) {
 
 	resp, err := client.Get(baseURL.String())
 	if err != nil {
-		var netError net.Error
-		if errors.As(err, &netError) && netError.Timeout() {
-			fmt.Println("upstream timed out")
+		var netErr net.Error
+		if errors.As(err, &netErr) && netErr.Timeout() {
+			log.Println("upstream timed out:", err)
 		} else {
-			fmt.Println("upstream unreachable:", err)
+			log.Println("upstream unreachable:", err)
 		}
-		http.Error(w, "classify service is currently unavailable", http.StatusServiceUnavailable)
+		writeError(w, http.StatusServiceUnavailable, "classify service is currently unavailable")
 		return
 	}
 	defer resp.Body.Close()
-	processedAt := time.Now().UTC()
-	if resp.StatusCode == 429 {
-		http.Error(w, "upstream rate limit reached, try again later", http.StatusTooManyRequests)
+
+	if resp.StatusCode == http.StatusTooManyRequests {
+		writeError(w, http.StatusTooManyRequests, "upstream rate limit reached, try again later")
 		return
 	}
-	if resp.StatusCode != 200 {
-		http.Error(w, "upstream service error", http.StatusInternalServerError)
+	if resp.StatusCode != http.StatusOK {
+		log.Printf("upstream returned unexpected status: %d", resp.StatusCode)
+		writeError(w, http.StatusBadGateway, "upstream service error")
 		return
 	}
+
 	var result struct {
-		Name string	`json:"name"`
-		Gender string `json:"gender"`
-		Count int `json:"count"`
+		Name        string  `json:"name"`
+		Gender      string  `json:"gender"`
+		Count       int     `json:"count"`
 		Probability float64 `json:"probability"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		http.Error(w, "failed to parse response", http.StatusInternalServerError)
+		log.Println("failed to decode upstream response:", err)
+		writeError(w, http.StatusInternalServerError, "failed to parse response")
 		return
 	}
+
+	processedAt := time.Now().UTC()
+
 	if result.Gender == "" {
-		writeJSON(w, http.StatusOK, map[string]any{
-        "name": result.Name,
-        "gender": nil,
-        "message": "no prediction available for this name",
-        "processed_at": processedAt,
-    })
+		writeSuccess(w, http.StatusOK, map[string]any{
+			"name":         result.Name,
+			"gender":       nil,
+			"is_confident": false,
+			"processed_at": processedAt,
+		})
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"name": result.Name,
-		"gender": result.Gender,
-		"sample_size": result.Count,
-		"probability": result.Probability,
+
+	writeSuccess(w, http.StatusOK, map[string]any{
+		"name":         result.Name,
+		"gender":       result.Gender,
+		"probability":  result.Probability,
+		"sample_size":  result.Count,
+		"is_confident": isConfident(result.Probability, result.Count),
 		"processed_at": processedAt,
 	})
-	
 }
 
-func main(){
+func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", rootHandler)
 	mux.HandleFunc("/classify", classifyHandler)
 
 	srv := &http.Server{
-		Addr: ":8080",
-		Handler: mux,
+		Addr:        ":8080",
+		Handler:     mux,
 		ReadTimeout: 5 * time.Second,
 		IdleTimeout: 20 * time.Second,
 	}
+
 	fmt.Println("Server is running on :8080")
 	log.Fatal(srv.ListenAndServe())
 }
