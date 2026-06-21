@@ -9,8 +9,18 @@ import (
 	"net/http"
 	"net/url"
 	"time"
+	"regexp"
+	"unicode/utf8"
 )
 
+var nameRegex = regexp.MustCompile(`^[A-Za-zÀ-ÖØ-öø-ÿ]+(?:[ '-][A-Za-zÀ-ÖØ-öø-ÿ]+)*$`)
+func isValidName(name string) bool {
+	length := utf8.RuneCountInString(name)
+	if length < 1 || length > 100 {
+		return false
+	}
+	return nameRegex.MatchString(name)
+}
 // ---- response envelope helpers ----
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
@@ -60,8 +70,8 @@ func classifyHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	name := r.URL.Query().Get("name")
-	if name == "" {
-		writeError(w, http.StatusBadRequest, "missing name parameter")
+	if !isValidName(name) {
+		writeError(w, http.StatusUnprocessableEntity, "unable to process name, please use a valid name")
 		return
 	}
 
